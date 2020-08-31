@@ -3,22 +3,28 @@ Convenient shortcuts to manage or check object permissions.
 """
 import warnings
 from collections import defaultdict
+from functools import partial
 from itertools import groupby
 
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
+from django.db import connection
 from django.db.models import Count, Q, QuerySet
 from django.shortcuts import _get_queryset
-from django.db.models.functions import Cast
+from django.db.models.expressions import Value
+from django.db.models.functions import Cast, Replace
 from django.db.models import (
-    IntegerField,
     AutoField,
     BigIntegerField,
+    CharField,
+    ForeignKey,
+    IntegerField,
     PositiveIntegerField,
     PositiveSmallIntegerField,
     SmallIntegerField,
+    UUIDField,
 )
 from guardian.core import ObjectPermissionChecker
 from guardian.ctypes import get_content_type
@@ -43,8 +49,8 @@ def assign_perm(perm, user_or_group, obj=None):
       ``guardian.exceptions.NotUserNorGroup`` exception
 
     :param obj: persisted Django's ``Model`` instance or QuerySet of Django
-      ``Model`` instances or ``None`` if assigning global permission.
-      Default is ``None``.
+      ``Model`` instances or list of Django ``Model`` instances or ``None``
+      if assigning global permission. Default is ``None``.
 
     We can assign permission for ``Model`` instance for specific user:
 
@@ -100,14 +106,16 @@ def assign_perm(perm, user_or_group, obj=None):
         if '.' in perm:
             app_label, perm = perm.split(".", 1)
 
-    if isinstance(obj, QuerySet):
+    if isinstance(obj, (QuerySet, list)):
         if isinstance(user_or_group, (QuerySet, list)):
             raise MultipleIdentityAndObjectError("Only bulk operations on either users/groups OR objects supported")
         if user:
-            model = get_user_obj_perms_model(obj.model)
+            model = get_user_obj_perms_model(
+                    obj[0] if isinstance(obj, list) else obj.model)
             return model.objects.bulk_assign_perm(perm, user, obj)
         if group:
-            model = get_group_obj_perms_model(obj.model)
+            model = get_group_obj_perms_model(
+                    obj[0] if isinstance(obj, list) else obj.model)
             return model.objects.bulk_assign_perm(perm, group, obj)
 
     if isinstance(user_or_group, (QuerySet, list)):
@@ -621,14 +629,12 @@ def get_objects_for_user(user, perms, klass=None, use_groups=True, any_perm=Fals
         user_obj_perms_queryset = counts.filter(
             object_pk_count__gte=len(codenames))
 
-    is_cast_integer = _is_cast_integer_pk(queryset)
-
     field_pk = user_fields[0]
     values = user_obj_perms_queryset
-    if is_cast_integer:
-        values = values.annotate(
-            obj_pk=Cast(field_pk, BigIntegerField())
-        )
+
+    handle_pk_field = _handle_pk_field(queryset)
+    if handle_pk_field is not None:
+        values = values.annotate(obj_pk=handle_pk_field(expression=field_pk))
         field_pk = 'obj_pk'
 
     values = values.values_list(field_pk, flat=True)
@@ -636,10 +642,8 @@ def get_objects_for_user(user, perms, klass=None, use_groups=True, any_perm=Fals
     if use_groups:
         field_pk = group_fields[0]
         values = groups_obj_perms_queryset
-        if is_cast_integer:
-            values = values.annotate(
-                obj_pk=Cast(field_pk, BigIntegerField())
-            )
+        if handle_pk_field is not None:
+            values = values.annotate(obj_pk=handle_pk_field(expression=field_pk))
             field_pk = 'obj_pk'
         values = values.values_list(field_pk, flat=True)
         q |= Q(pk__in=values)
@@ -789,15 +793,12 @@ def get_objects_for_group(group, perms, klass=None, any_perm=False, accept_globa
         objects = queryset.filter(pk__in=pk_list)
         return objects
 
-    is_cast_integer = _is_cast_integer_pk(queryset)
-
     field_pk = fields[0]
     values = groups_obj_perms_queryset
 
-    if is_cast_integer:
-        values = values.annotate(
-            obj_pk=Cast(field_pk, BigIntegerField())
-        )
+    handle_pk_field = _handle_pk_field(queryset)
+    if handle_pk_field is not None:
+        values = values.annotate(obj_pk=handle_pk_field(expression=field_pk))
         field_pk = 'obj_pk'
 
     values = values.values_list(field_pk, flat=True)
@@ -820,3 +821,35 @@ def filter_perms_queryset_by_objects(perms_queryset, objects):
         return perms_queryset.filter(
             **{'{}__in'.format(field): list(objects.values_list(
                 'pk', flat=True).distinct().order_by())})
+
+
+def _handle_pk_field(queryset):
+    pk = queryset.model._meta.pk
+
+    if isinstance(pk, ForeignKey):
+        return _handle_pk_field(pk.target_field)
+
+    if isinstance(
+        pk,
+        (
+            IntegerField,
+            AutoField,
+            BigIntegerField,
+            PositiveIntegerField,
+            PositiveSmallIntegerField,
+            SmallIntegerField,
+        ),
+    ):
+        return partial(Cast, output_field=BigIntegerField())
+
+    if isinstance(pk, UUIDField):
+        if connection.features.has_native_uuid_field:
+            return partial(Cast, output_field=UUIDField())
+        return partial(
+            Replace,
+            text=Value('-'),
+            replacement=Value(''),
+            output_field=CharField(),
+        )
+
+    return None
